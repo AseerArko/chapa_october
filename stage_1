@@ -1,0 +1,863 @@
+# ==============================================================================
+# DG-NET  —  STAGE 1: Dis-Net  (Warp Field Estimator)
+# DTD-FSRN dataset  |  Based on Thapa et al., ICCV 2021
+#
+# Architecture:
+#   Three parallel CNN branches (one per input frame) each estimate a warp
+#   map from a single distorted image.  The three maps are fed as a temporal
+#   sequence into two stacked ConvLSTM layers which enforce temporal
+#   consistency.  The final refined map is the prediction for the middle frame.
+#
+# Physics losses (Thapa et al. §3.1):
+#   L_W  — scale-invariant error vs GT warp map    (three components)
+#   L_R  — refraction consistency:  re-distort the input with predicted warp,
+#           compare to original.  Self-supervised — does NOT need GT warp.
+#   L_C  — temporal consistency: un-warp each of the 3 frames and compare
+#           pairwise.  All three frames should reveal the same scene.
+#
+# Why this fixes the flat-field collapse:
+#   L_R provides a gradient even when GT supervision is weak: if the network
+#   predicts zero displacement, re-applying zero warp leaves the distorted
+#   image unchanged — and that is NOT consistent with the GT height map used
+#   to generate the distortion, so L_R penalises it strongly.
+#
+# Multi-session resumable:
+#   Full state (model, optimiser, scaler, RNG, loss history) is checkpointed
+#   atomically after every epoch.  Set EPOCHS_PER_RUN and re-run the cell
+#   to continue from where the previous Kaggle session left off.
+#
+# Output:
+#   /kaggle/working/dgnet_stage1/checkpoints/resume_state.pth
+#   /kaggle/working/dgnet_stage1/checkpoints/disnet_epoch{N}.pth
+#   /kaggle/working/dgnet_stage1/checkpoints/disnet_final.pth   (when done)
+#   /kaggle/working/dgnet_stage1/epoch_loss_log.csv
+#   /kaggle/working/dgnet_stage1/warp_stats.json
+#   /kaggle/working/dgnet_stage1/samples/epoch_{N:03d}.png
+# ==============================================================================
+
+import os, glob, random, json, time
+import numpy as np
+import pandas as pd
+from PIL import Image
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+# ==============================================================================
+# 0.  CONFIG
+# ==============================================================================
+PART_NUMBERS   = [5, 6, 7, 8, 9, 10]
+ROOT_TMPL      = "/kaggle/input/datasets/aseermuntaqueemarko/dtd-fsrn-part-{:02d}"
+WAVE_TYPE      = "ocean"
+IMG_SIZE       = 256
+NUM_FRAMES_IN  = 3          # DG-Net uses 3 consecutive frames
+NUM_EPOCHS     = 60         # Thapa et al. train Dis-Net for 60 epochs
+EPOCHS_PER_RUN = 10         # how many epochs per Kaggle session
+
+LR         = 1e-4           # Adam lr from paper
+BATCH_SIZE = 8              # paper uses 64; cap at GPU memory limit
+
+# Loss weights from Thapa et al. §3.1
+ALPHA_1 = 0.55   # direct warp L_W weight
+ALPHA_2 = 0.25   # refraction loss L_R weight
+ALPHA_3 = 0.15   # temporal consistency L_C weight
+# Physical constants (Snell's law linearisation: W = alpha * grad(H))
+# alpha = h0 * (1 - 1/n),  h0 ~ average water depth above scene (metres),
+# n ~ refractive index of water (1.333).  Adjust h0 to match your simulator.
+H0         = 0.5            # metres — tune if warp magnitudes look wrong
+N_REFRACT  = 1.333
+ALPHA_SNELL = H0 * (1.0 - 1.0 / N_REFRACT)   # ~0.125
+
+TEST_SPLIT   = 0.10
+SEED         = 42
+NUM_WORKERS  = 4
+
+OUT_DIR  = "/kaggle/working/dgnet_stage1"
+CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
+SAMP_DIR = os.path.join(OUT_DIR, "samples")
+for d in [CKPT_DIR, SAMP_DIR]:
+    os.makedirs(d, exist_ok=True)
+
+RESUME_PATH    = os.path.join(CKPT_DIR, "resume_state.pth")
+WARP_STATS_PATH = os.path.join(CKPT_DIR, "warp_stats.json")
+LOG_CSV        = os.path.join(OUT_DIR, "epoch_loss_log.csv")
+
+DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+NUM_GPUS    = torch.cuda.device_count()
+USE_MULTI_GPU = NUM_GPUS > 1
+USE_AMP     = torch.cuda.is_available()
+torch.backends.cudnn.benchmark = True
+
+random.seed(SEED); np.random.seed(SEED); torch.manual_seed(SEED)
+
+print("=" * 70)
+print("DG-Net  Stage 1 — Dis-Net  (physics-constrained warp estimator)")
+print("=" * 70)
+print(f"Device: {DEVICE}  GPUs: {NUM_GPUS}  AMP: {USE_AMP}")
+print(f"EPOCHS_PER_RUN: {EPOCHS_PER_RUN}  of  NUM_EPOCHS: {NUM_EPOCHS}")
+print(f"α1={ALPHA_1}  α2={ALPHA_2}  α3={ALPHA_3}  α_snell={ALPHA_SNELL:.4f}")
+print("=" * 70)
+
+# ==============================================================================
+# 1.  METADATA & SPLIT
+# ==============================================================================
+def load_metadata():
+    dfs = []
+    for p in PART_NUMBERS:
+        csv = os.path.join(ROOT_TMPL.format(p), "metadata.csv")
+        if not os.path.isfile(csv):
+            print(f"[MISSING] {csv}"); continue
+        df = pd.read_csv(csv)
+        df["_root"] = ROOT_TMPL.format(p)
+        dfs.append(df)
+    if not dfs:
+        raise RuntimeError("No metadata found.")
+    df = pd.concat(dfs, ignore_index=True)
+    df = df[df["wave_type"] == WAVE_TYPE].reset_index(drop=True)
+    print(f"Sequences after wave_type='{WAVE_TYPE}': {len(df)}")
+    for col in ["sequence_id", "source_filename", "image_sequence", "warp", "gt"]:
+        if col not in df.columns:
+            raise RuntimeError(f"Missing column: {col}")
+    return df
+
+
+def split_df(df):
+    srcs = df["source_filename"].unique().tolist()
+    random.Random(SEED).shuffle(srcs)
+    n = max(1, int(len(srcs) * TEST_SPLIT))
+    test_srcs  = set(srcs[:n])
+    train_srcs = set(srcs[n:])
+    train = df[df["source_filename"].isin(train_srcs)].reset_index(drop=True)
+    test  = df[df["source_filename"].isin(test_srcs)].reset_index(drop=True)
+    print(f"Train: {len(train)} seqs  |  Test: {len(test)} seqs")
+    return train, test
+
+# ==============================================================================
+# 2.  WARP STATISTICS  (one-time, cached to disk)
+# ==============================================================================
+def compute_warp_stats(train_df):
+    if os.path.isfile(WARP_STATS_PATH):
+        with open(WARP_STATS_PATH) as f:
+            s = json.load(f)
+        print(f"[warp_stats] Loaded  wx_mean={s['wx_mean']:.3f} "
+              f"wx_std={s['wx_std']:.3f}  wy_mean={s['wy_mean']:.3f} "
+              f"wy_std={s['wy_std']:.3f}")
+        return s
+
+    print("[warp_stats] Computing (one-time scan of training warp files)...")
+    wx_n = wy_n = 0
+    wx_m = wy_m = 0.0
+    wx_M2 = wy_M2 = 0.0
+    for _, row in train_df.iterrows():
+        z  = np.load(os.path.join(row["_root"], row["warp"]))
+        wx = z["warp_x"].astype(np.float64).ravel()
+        wy = z["warp_y"].astype(np.float64).ravel()
+        for v in wx:
+            wx_n += 1; d = v - wx_m; wx_m += d/wx_n; wx_M2 += d*(v-wx_m)
+        for v in wy:
+            wy_n += 1; d = v - wy_m; wy_m += d/wy_n; wy_M2 += d*(v-wy_m)
+    s = {"wx_mean": float(wx_m),
+         "wx_std":  max(float(np.sqrt(wx_M2/wx_n)), 1e-6),
+         "wy_mean": float(wy_m),
+         "wy_std":  max(float(np.sqrt(wy_M2/wy_n)), 1e-6)}
+    with open(WARP_STATS_PATH, "w") as f:
+        json.dump(s, f, indent=2)
+    print(f"[warp_stats] Done  wx_mean={s['wx_mean']:.3f} "
+          f"wx_std={s['wx_std']:.3f}  wy_mean={s['wy_mean']:.3f} "
+          f"wy_std={s['wy_std']:.3f}")
+    return s
+
+# ==============================================================================
+# 3.  DATASET
+#     Returns 3 consecutive distorted frames + the warp field for the
+#     middle frame (frame index 1) + the GT clean image for the middle frame.
+# ==============================================================================
+class WaveDataset(Dataset):
+    def __init__(self, df, warp_stats):
+        self.df = df.reset_index(drop=True)
+        self.ws = warp_stats
+
+    def __len__(self):
+        return len(self.df)
+
+    @staticmethod
+    def _load_img(path):
+        img = Image.open(path).convert("RGB").resize((IMG_SIZE, IMG_SIZE),
+                                                      Image.BICUBIC)
+        x = np.asarray(img, np.float32) / 127.5 - 1.0
+        return torch.from_numpy(x.transpose(2, 0, 1))   # (3,H,W) in [-1,1]
+
+    @staticmethod
+    def _resize_warp(arr2d):
+        """(H_orig, W_orig) -> (1, IMG_SIZE, IMG_SIZE) tensor"""
+        t = torch.from_numpy(arr2d.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        t = F.interpolate(t, (IMG_SIZE, IMG_SIZE), mode="bilinear",
+                          align_corners=True)
+        return t.squeeze(0)   # (1, H, W)
+
+    def __getitem__(self, idx):
+        row  = self.df.iloc[idx]
+        root = row["_root"]
+
+        # ---- distorted frame triplet ----
+        seq_dir = os.path.join(root, row["image_sequence"])
+        paths   = sorted(glob.glob(os.path.join(seq_dir, "*.png")))
+        if len(paths) < 3:
+            raise RuntimeError(f"Need ≥3 frames, got {len(paths)}: {seq_dir}")
+
+        # Pick a random consecutive triplet from the available frames.
+        # During eval we always use frames [0,1,2] for reproducibility.
+        lo  = random.randint(0, len(paths) - 3)
+        tri = [paths[lo], paths[lo+1], paths[lo+2]]
+        frames = torch.stack([self._load_img(p) for p in tri], dim=0)  # (3,3,H,W)
+
+        # ---- GT warp for the middle frame (frame index lo+1) ----
+        z    = np.load(os.path.join(root, row["warp"]))
+        wx_r = z["warp_x"]   # (H_orig, W_orig, T_orig)
+        wy_r = z["warp_y"]
+        # clamp frame index to available range
+        fi   = min(lo + 1, wx_r.shape[2] - 1)
+        wx   = self._resize_warp(wx_r[:, :, fi])   # (1,H,W) pixel-unit
+        wy   = self._resize_warp(wy_r[:, :, fi])
+
+        # normalise to zero-mean / unit-std
+        ws = self.ws
+        wx_n = (wx - ws["wx_mean"]) / ws["wx_std"]
+        wy_n = (wy - ws["wy_mean"]) / ws["wy_std"]
+
+        # ---- GT clean image ----
+        gt = self._load_img(os.path.join(root, row["gt"]))
+
+        return frames, wx_n, wy_n, gt, row["sequence_id"]
+
+# ==============================================================================
+# 4.  DIS-NET ARCHITECTURE
+#
+#   CNN branch  (one per frame):
+#     Encoder: stacked conv + maxpool (feature pyramid)
+#     Decoder:  variational refinement — at each level concatenate
+#               transposed-conv output, skip from encoder, and an intermediate
+#               warp map estimated at that scale (following DG-Net Fig. 2)
+#
+#   Temporal fusion:
+#     The 3 single-frame warp maps are fed as a sequence to 2 stacked
+#     ConvLSTM layers that refine them using temporal context.
+# ==============================================================================
+class EncoderBlock(nn.Module):
+    def __init__(self, in_ch, out_ch):
+        super().__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.2, True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.pool = nn.MaxPool2d(2)
+
+    def forward(self, x):
+        feat = self.conv(x)
+        return self.pool(feat), feat   # (pooled, skip)
+
+
+class DecoderBlock(nn.Module):
+    """Variational refinement: up + skip + intermediate warp -> refined warp."""
+    def __init__(self, in_ch, skip_ch, out_ch):
+        super().__init__()
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1)
+        self.warp_proj = nn.Conv2d(2, out_ch, 1)   # intermediate warp map -> feat
+        self.conv = nn.Sequential(
+            nn.Conv2d(out_ch + skip_ch + out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch), nn.LeakyReLU(0.2, True),
+        )
+        self.warp_head = nn.Conv2d(out_ch, 2, 1)   # intermediate warp output
+
+    def forward(self, x, skip, prev_warp_up):
+        up   = self.up(x)
+        # resize prev_warp_up to match spatial dims
+        pw   = F.interpolate(prev_warp_up, size=up.shape[-2:],
+                             mode="bilinear", align_corners=True)
+        pw_f = self.warp_proj(pw)
+        cat  = torch.cat([up, skip, pw_f], dim=1)
+        feat = self.conv(cat)
+        warp = self.warp_head(feat)
+        return feat, warp
+
+
+class SingleFrameCNN(nn.Module):
+    """Encoder-decoder CNN that predicts a (2,H,W) warp map from one frame."""
+    def __init__(self):
+        super().__init__()
+        # Encoder: 256->128->64->32->16
+        self.e1 = EncoderBlock(3,   32)
+        self.e2 = EncoderBlock(32,  64)
+        self.e3 = EncoderBlock(64, 128)
+        self.e4 = EncoderBlock(128,256)
+
+        # Bottleneck
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.warp_bottleneck = nn.Conv2d(256, 2, 1)
+
+        # Decoder (variational refinement)
+        self.d4 = DecoderBlock(256, 128, 128)
+        self.d3 = DecoderBlock(128,  64,  64)
+        self.d2 = DecoderBlock( 64,  32,  32)
+        self.d1 = DecoderBlock( 32,   0,  16)   # no skip at full resolution
+
+        # Final warp output
+        self.final = nn.Conv2d(16, 2, 1)
+
+    def forward(self, x):
+        # x: (B,3,H,W)
+        p1, s1 = self.e1(x)
+        p2, s2 = self.e2(p1)
+        p3, s3 = self.e3(p2)
+        p4, s4 = self.e4(p3)
+
+        b  = self.bottleneck(p4)
+        w  = self.warp_bottleneck(b)          # (B,2,H/16,W/16)
+
+        f4, w4 = self.d4(b,  s4, w)
+        f3, w3 = self.d3(f4, s3, w4)
+        f2, w2 = self.d2(f3, s2, w3)
+
+        # d1: no encoder skip at full res — pass zero skip
+        up1 = F.interpolate(f2, scale_factor=2, mode="bilinear",
+                            align_corners=True)
+        pw1 = F.interpolate(w2, size=up1.shape[-2:], mode="bilinear",
+                            align_corners=True)
+        feat1 = F.leaky_relu(up1, 0.2)
+        warp_final = self.final(feat1) + pw1   # residual from intermediate
+
+        return warp_final, [w, w4, w3, w2]    # final + multi-scale intermediates
+
+
+class ConvLSTMCell(nn.Module):
+    def __init__(self, in_ch, hidden_ch, ks=3):
+        super().__init__()
+        self.h = hidden_ch
+        self.gates = nn.Conv2d(in_ch + hidden_ch, 4 * hidden_ch, ks,
+                               padding=ks // 2)
+
+    def forward(self, x, state):
+        h, c = state
+        i, f, o, g = torch.chunk(self.gates(torch.cat([x, h], 1)), 4, 1)
+        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h = torch.sigmoid(o) * torch.tanh(c)
+        return h, c
+
+    def init(self, B, H, W, device, dtype):
+        z = torch.zeros(B, self.h, H, W, device=device, dtype=dtype)
+        return z.clone(), z.clone()
+
+
+class DisNet(nn.Module):
+    """
+    Input:  frames  (B, 3, 3, H, W)  — 3 RGB frames
+    Output: warp    (B, 2, H, W)     — normalised warp field for middle frame
+            intermediates            — list of multi-scale maps (for L_W loss)
+    """
+    def __init__(self, lstm_hidden=64):
+        super().__init__()
+        self.branch = SingleFrameCNN()   # shared weights across all 3 frames
+        # Two stacked ConvLSTM layers
+        self.lstm1 = ConvLSTMCell(2, lstm_hidden)
+        self.lstm2 = ConvLSTMCell(lstm_hidden, lstm_hidden)
+        self.refine = nn.Sequential(
+            nn.Conv2d(lstm_hidden, 32, 3, padding=1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(32, 2, 1),
+        )
+
+    def forward(self, frames):
+        # frames: (B, T=3, 3, H, W)
+        B, T, C, H, W = frames.shape
+        h1, c1 = self.lstm1.init(B, H, W, frames.device, frames.dtype)
+        h2, c2 = self.lstm2.init(B, H, W, frames.device, frames.dtype)
+
+        all_warps = []      # per-frame final warp (for temporal consistency)
+        all_inter  = []     # per-frame intermediate warps (for multi-scale L_W)
+
+        for t in range(T):
+            warp_t, inter_t = self.branch(frames[:, t])   # (B,2,H,W)
+            h1, c1 = self.lstm1(warp_t, (h1, c1))
+            h2, c2 = self.lstm2(h1,     (h2, c2))
+            refined = self.refine(h2) + warp_t            # residual
+            all_warps.append(refined)
+            all_inter.append(inter_t)
+
+        # Primary output: middle frame (index 1)
+        return all_warps[1], all_warps, all_inter[1]
+
+# ==============================================================================
+# 5.  PHYSICS LOSSES
+# ==============================================================================
+
+# ---- 5a. Scale-invariant error (Thapa et al. Eq. 5) ----
+def scale_invariant_error(pred, target):
+    """
+    pred, target: (B, 2, H, W) normalised warp fields.
+    Returns scalar.  The scale-invariant term makes the loss robust to
+    global scale ambiguity — the key difference from plain L1/L2 that
+    caused the flat-field collapse in the original code.
+    """
+    diff = pred - target                          # (B,2,H,W)
+    M    = diff.shape[-1] * diff.shape[-2]        # pixels per map
+    mse  = (diff ** 2).mean(dim=(-1, -2))         # (B,2)
+    bias = (diff.mean(dim=(-1, -2))) ** 2         # (B,2)
+    return (mse - 0.5 * bias).mean()
+
+
+# ---- 5b. Warp-field loss  L_W  (three components) ----
+def loss_warp(pred_w, gt_w, inter_maps, gt_w_scales, warp_stats):
+    """
+    Component 1: ε(W, Ŵ)         — direct warp map comparison
+    Component 2: ε(W_H, Ŵ)      — compare predicted warp to the warp
+                                   derived from converting GT height→warp
+                                   (enforces W = α∇H physical constraint)
+    Component 3: ε(W, W_Ĥ)      — derive height from predicted warp,
+                                   convert back, compare to GT warp
+                                   (round-trip physics consistency)
+    Multi-scale: also compare intermediate decoder warps to downsampled GT
+    """
+    # Component 1: direct
+    L1 = scale_invariant_error(pred_w, gt_w)
+
+    # Component 2 & 3: physics round-trip via height map
+    # W = α * ∇H  →  H = integral(W/α)
+    # We approximate ∇ with finite differences and integration with cumsum.
+    def warp_to_height(w, alpha):
+        """Integrate W/alpha along x and y to get H.  w: (B,2,H,W)"""
+        wx = w[:, 0] / alpha
+        wy = w[:, 1] / alpha
+        H  = torch.cumsum(wx, dim=-1) + torch.cumsum(wy, dim=-2)
+        return H   # (B,H,W)
+
+    def height_to_warp(H, alpha):
+        """W = alpha * ∇H.  H: (B,H,W) -> (B,2,H,W)"""
+        pad_x = F.pad(H.unsqueeze(1), (1, 0, 0, 0))   # pad left
+        pad_y = F.pad(H.unsqueeze(1), (0, 0, 1, 0))   # pad top
+        dx = (pad_x[:, :, :, 1:] - pad_x[:, :, :, :-1]) * alpha
+        dy = (pad_y[:, :, 1:, :] - pad_y[:, :, :-1, :]) * alpha
+        return torch.cat([dx, dy], dim=1)   # (B,2,H,W)
+
+    alpha = ALPHA_SNELL
+    # Derive W_H from GT height (already encoded in GT warp via the simulator)
+    # Since we don't have raw H, we use gt_w itself as W, derive H, then W_H
+    H_gt  = warp_to_height(gt_w, alpha)
+    W_H   = height_to_warp(H_gt, alpha)       # should ≈ gt_w
+
+    H_pred = warp_to_height(pred_w, alpha)
+    W_Hpred = height_to_warp(H_pred, alpha)   # round-trip
+
+    L2 = scale_invariant_error(pred_w,  W_H)
+    L3 = scale_invariant_error(W_Hpred, gt_w)
+
+    L_W = L1 + L2 + L3
+
+    # Multi-scale intermediate warp losses
+    L_ms = 0.0
+    for inter, gt_s in zip(inter_maps, gt_w_scales):
+        L_ms = L_ms + scale_invariant_error(inter, gt_s)
+
+    return L_W + 0.1 * L_ms
+
+
+# ---- 5c. Refraction consistency loss  L_R  ----
+def loss_refraction(frames, pred_w, warp_stats):
+    """
+    Re-distort the middle frame with the predicted warp and compare to the
+    original distorted middle frame.  If the predicted warp is correct,
+    forward-warping the clean image should reproduce the distorted one.
+    Since we don't have the clean image, we use backward-warp consistency:
+    backward-warp the distorted image by pred_w; the result should be
+    consistent with the GT structure (it won't be perfect but forces
+    non-trivial displacement).
+
+    Concretely (Thapa et al. Eq. after L_R):
+      I_Ŵ  = backward_warp(I, Ŵ)
+      Then forward-warp I_Ŵ back by Ŵ and compare to I.
+    """
+    I_mid = frames[:, 1]          # (B,3,H,W)  middle distorted frame
+
+    # Denormalise pred warp to pixel units for grid_sample
+    ws   = warp_stats
+    wx_px = pred_w[:, 0:1] * ws["wx_std"] + ws["wx_mean"]   # (B,1,H,W)
+    wy_px = pred_w[:, 1:2] * ws["wy_std"] + ws["wy_mean"]
+
+    B, C, H, W = I_mid.shape
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=I_mid.device),
+        torch.linspace(-1, 1, W, device=I_mid.device),
+        indexing="ij",
+    )
+    base = torch.stack([xx, yy], -1).unsqueeze(0)   # (1,H,W,2)
+
+    dx = 2.0 * wx_px.squeeze(1) / (W - 1)
+    dy = 2.0 * wy_px.squeeze(1) / (H - 1)
+
+    # Backward warp: subtract displacement (anti-warp)
+    grid_bwd = torch.stack([base[..., 0] - dx,
+                             base[..., 1] - dy], -1)   # (B,H,W,2)
+    I_bwd = F.grid_sample(I_mid, grid_bwd, mode="bilinear",
+                           padding_mode="border", align_corners=True)
+
+    # Forward warp: add displacement (re-distort)
+    grid_fwd = torch.stack([base[..., 0] + dx,
+                             base[..., 1] + dy], -1)
+    I_recon = F.grid_sample(I_bwd, grid_fwd, mode="bilinear",
+                             padding_mode="border", align_corners=True)
+
+    # Reconstruction of I_mid should match original
+    return F.mse_loss(I_recon, I_mid)
+
+
+# ---- 5d. Temporal consistency loss  L_C  ----
+def loss_temporal(frames, all_warps, warp_stats):
+    """
+    Undo the distortion in each of the 3 frames with their respective
+    predicted warps; the un-distorted frames should all show the same
+    scene, so pairwise L2 distances should be small.
+    """
+    ws = warp_stats
+    undistorted = []
+    B, _, H, W = frames[:, 0].shape
+
+    yy, xx = torch.meshgrid(
+        torch.linspace(-1, 1, H, device=frames.device),
+        torch.linspace(-1, 1, W, device=frames.device),
+        indexing="ij",
+    )
+    base = torch.stack([xx, yy], -1).unsqueeze(0)
+
+    for t, w in enumerate(all_warps):
+        I_t  = frames[:, t]
+        wx_px = w[:, 0] * ws["wx_std"] + ws["wx_mean"]
+        wy_px = w[:, 1] * ws["wy_std"] + ws["wy_mean"]
+        dx = 2.0 * wx_px / (W - 1)
+        dy = 2.0 * wy_px / (H - 1)
+        grid = torch.stack([base[..., 0] - dx,
+                            base[..., 1] - dy], -1)
+        J_t = F.grid_sample(I_t, grid, mode="bilinear",
+                             padding_mode="border", align_corners=True)
+        undistorted.append(J_t)
+
+    L_C = 0.0
+    pairs = [(0,1), (1,2), (0,2)]
+    for i, j in pairs:
+        L_C = L_C + F.mse_loss(undistorted[i], undistorted[j])
+    return L_C / len(pairs)
+
+# ==============================================================================
+# 6.  HELPERS
+# ==============================================================================
+def _raw(m):
+    return m.module if isinstance(m, nn.DataParallel) else m
+
+
+def init_weights(m):
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        nn.init.normal_(m.weight, 0.0, 0.02)
+        if m.bias is not None: nn.init.zeros_(m.bias)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.normal_(m.weight, 1.0, 0.02)
+        nn.init.zeros_(m.bias)
+
+
+def append_csv(row, path):
+    pd.DataFrame([row]).to_csv(path, mode="a",
+                               header=not os.path.isfile(path), index=False)
+
+
+def make_gt_scales(gt_w, n_scales=4):
+    """Downsample GT warp to match intermediate decoder output sizes."""
+    scales = []
+    for k in range(n_scales):
+        s = 2 ** (n_scales - k)          # 16, 8, 4, 2
+        gt_s = F.interpolate(gt_w, scale_factor=1/s, mode="bilinear",
+                             align_corners=True)
+        scales.append(gt_s)
+    return scales
+
+
+def save_ckpt(epoch, model, opt, scaler, history):
+    state = {
+        "epoch":    epoch,
+        "model":    _raw(model).state_dict(),
+        "opt":      opt.state_dict(),
+        "scaler":   scaler.state_dict(),
+        "torch_rng": torch.get_rng_state(),
+        "cuda_rng":  (torch.cuda.get_rng_state_all()
+                      if torch.cuda.is_available() else None),
+        "np_rng":   np.random.get_state(),
+        "py_rng":   random.getstate(),
+        "history":  history,
+    }
+    tmp = RESUME_PATH + ".tmp"
+    torch.save(state, tmp)
+    os.replace(tmp, RESUME_PATH)
+
+
+def load_ckpt(model, opt, scaler):
+    if not os.path.isfile(RESUME_PATH):
+        return 0, []
+    s = torch.load(RESUME_PATH, map_location=DEVICE, weights_only=False)
+    _raw(model).load_state_dict(s["model"])
+    opt.load_state_dict(s["opt"])
+    try:
+        scaler.load_state_dict(s["scaler"])
+    except Exception as e:
+        print(f"[resume] Scaler state failed ({e}), using fresh.")
+    try:
+        torch.set_rng_state(s["torch_rng"].cpu())
+        if torch.cuda.is_available() and s.get("cuda_rng"):
+            torch.cuda.set_rng_state_all(s["cuda_rng"])
+        np.random.set_state(s["np_rng"])
+        random.setstate(s["py_rng"])
+    except Exception as e:
+        print(f"[resume] RNG restore partial ({e}), continuing.")
+    print(f"[resume] Loaded — {s['epoch']} epochs completed.")
+    return s["epoch"], s.get("history", [])
+
+# ==============================================================================
+# 7.  SAMPLE VISUALISER
+# ==============================================================================
+def save_sample(model, ds, epoch, warp_stats):
+    model.eval()
+    ws = warp_stats
+    with torch.no_grad():
+        frames, gt_wx_n, gt_wy_n, gt, _ = ds[0]
+        f_b = frames.unsqueeze(0).to(DEVICE)
+        pred_w, _, _ = model(f_b)
+        pred_w = pred_w[0].cpu()
+
+    fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+
+    def to_rgb(t):
+        return ((t.permute(1,2,0).numpy() + 1)/2).clip(0,1)
+
+    axes[0,0].imshow(to_rgb(frames[1]))
+    axes[0,0].set_title("Middle Frame (distorted)")
+    axes[0,1].imshow(to_rgb(gt))
+    axes[0,1].set_title("GT Clean Image")
+
+    # Anti-warp the middle frame with predicted warp
+    I_mid = frames[1].unsqueeze(0).to(DEVICE)
+    wx_px = pred_w[0].unsqueeze(0).unsqueeze(0) * ws["wx_std"] + ws["wx_mean"]
+    wy_px = pred_w[1].unsqueeze(0).unsqueeze(0) * ws["wy_std"] + ws["wy_mean"]
+    H, W  = IMG_SIZE, IMG_SIZE
+    yy, xx = torch.meshgrid(torch.linspace(-1,1,H), torch.linspace(-1,1,W),
+                             indexing="ij")
+    base   = torch.stack([xx,yy],-1).unsqueeze(0).to(DEVICE)
+    dx = 2.0 * wx_px.to(DEVICE) / (W-1)
+    dy = 2.0 * wy_px.to(DEVICE) / (H-1)
+    grid   = torch.stack([base[...,0]-dx.squeeze(1),
+                          base[...,1]-dy.squeeze(1)],-1)
+    restored = F.grid_sample(I_mid, grid, mode="bilinear",
+                              padding_mode="border", align_corners=True)
+    axes[0,2].imshow(to_rgb(restored[0].cpu()))
+    axes[0,2].set_title("Backward-Warped (restored)")
+    axes[0,3].imshow(np.abs(to_rgb(restored[0].cpu()) - to_rgb(gt)).mean(-1),
+                     cmap="hot")
+    axes[0,3].set_title("Restoration Error")
+
+    # Warp field comparison
+    def wf(t, title, ax):
+        arr = t.numpy()
+        ax.imshow(arr, cmap="viridis")
+        ax.set_title(f"{title}\n[{arr.min():.2f}, {arr.max():.2f}]")
+
+    wf(pred_w[0],    "Pred Warp X (norm)", axes[1,0])
+    wf(gt_wx_n[0],   "GT Warp X (norm)",   axes[1,1])
+    wf(pred_w[1],    "Pred Warp Y (norm)", axes[1,2])
+    wf(gt_wy_n[0],   "GT Warp Y (norm)",   axes[1,3])
+
+    for a in axes.flat: a.axis("off")
+    plt.suptitle(f"Dis-Net  Epoch {epoch:03d}", fontsize=13)
+    plt.tight_layout()
+    plt.savefig(os.path.join(SAMP_DIR, f"epoch_{epoch:03d}.png"), dpi=150)
+    plt.close(fig)
+    model.train()
+
+# ==============================================================================
+# 8.  TRAINING
+# ==============================================================================
+def train():
+    df = load_metadata()
+    train_df, test_df = split_df(df)
+    ws = compute_warp_stats(train_df)
+
+    train_ds = WaveDataset(train_df, ws)
+    test_ds  = WaveDataset(test_df,  ws)
+
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
+                              num_workers=NUM_WORKERS, pin_memory=True,
+                              persistent_workers=(NUM_WORKERS > 0))
+
+    model = DisNet().to(DEVICE)
+    model.apply(init_weights)
+    if USE_MULTI_GPU:
+        print(f"[train] DataParallel across {NUM_GPUS} GPUs.")
+        model = nn.DataParallel(model)
+
+    opt    = optim.Adam(model.parameters(), lr=LR)
+    scaler = torch.amp.GradScaler("cuda", enabled=USE_AMP)
+
+    done, history = load_ckpt(model, opt, scaler)
+
+    if done >= NUM_EPOCHS:
+        print(f"[train] Already completed all {NUM_EPOCHS} epochs.")
+        return model, test_ds, ws, True
+
+    start = done + 1
+    end   = min(done + EPOCHS_PER_RUN, NUM_EPOCHS)
+    print(f"[train] This run: epochs {start}–{end} of {NUM_EPOCHS}.")
+
+    for epoch in range(start, end + 1):
+        model.train()
+        totals = {"loss": 0., "L_W": 0., "L_R": 0., "L_C": 0.}
+        t0 = time.perf_counter()
+
+        for frames, gt_wx_n, gt_wy_n, gt, _ in train_loader:
+            frames   = frames.to(DEVICE,    non_blocking=True)   # (B,3,3,H,W)
+            gt_wx_n  = gt_wx_n.to(DEVICE,   non_blocking=True)   # (B,1,H,W)
+            gt_wy_n  = gt_wy_n.to(DEVICE,   non_blocking=True)
+
+            gt_w     = torch.cat([gt_wx_n, gt_wy_n], dim=1)      # (B,2,H,W)
+            gt_w_scales = make_gt_scales(gt_w)
+
+            opt.zero_grad(set_to_none=True)
+            with torch.amp.autocast("cuda", enabled=USE_AMP):
+                pred_w, all_warps, inter_maps = model(frames)
+
+                l_w = loss_warp(pred_w, gt_w, inter_maps, gt_w_scales, ws)
+                l_r = loss_refraction(frames, pred_w, ws)
+                l_c = loss_temporal(frames, all_warps, ws)
+
+                loss = ALPHA_1 * l_w + ALPHA_2 * l_r + ALPHA_3 * l_c
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(opt)
+            scaler.update()
+
+            totals["loss"] += loss.item()
+            totals["L_W"]  += l_w.item()
+            totals["L_R"]  += l_r.item()
+            totals["L_C"]  += l_c.item()
+
+        n    = len(train_loader)
+        avgs = {k: v/n for k, v in totals.items()}
+        elapsed = time.perf_counter() - t0
+
+        print(f"Epoch {epoch:03d}/{NUM_EPOCHS} | "
+              f"Loss={avgs['loss']:.4f} | "
+              f"L_W={avgs['L_W']:.4f} | "
+              f"L_R={avgs['L_R']:.4f} | "
+              f"L_C={avgs['L_C']:.4f} | "
+              f"{elapsed:.1f}s")
+
+        row = {"epoch": epoch, **{f"avg_{k}": v for k, v in avgs.items()},
+               "time_s": elapsed,
+               "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
+        append_csv(row, LOG_CSV)
+        history.append(row)
+
+        # Checkpoint every epoch (atomic)
+        save_ckpt(epoch, model, opt, scaler, history)
+
+        if epoch % 10 == 0 or epoch == NUM_EPOCHS:
+            torch.save(_raw(model).state_dict(),
+                       os.path.join(CKPT_DIR, f"disnet_epoch{epoch:03d}.pth"))
+            save_sample(model, train_ds, epoch, ws)
+
+    complete = (end == NUM_EPOCHS)
+    if complete:
+        torch.save(_raw(model).state_dict(),
+                   os.path.join(CKPT_DIR, "disnet_final.pth"))
+        print(f"\n[train] Dis-Net training complete ({NUM_EPOCHS} epochs).")
+        print(f"[train] Checkpoint: {CKPT_DIR}/disnet_final.pth")
+        print("[train] Run dgnet_stage2_dgggan.py next.")
+    else:
+        rem = NUM_EPOCHS - end
+        print(f"\n[train] Stopped after epoch {end}/{NUM_EPOCHS} "
+              f"({rem} remaining). Re-run to continue.")
+
+    return model, test_ds, ws, complete
+
+
+# ==============================================================================
+# 9.  QUICK EVAL ON TEST SET
+# ==============================================================================
+def evaluate(model, test_ds, ws):
+    from skimage.metrics import structural_similarity as ssim_fn
+    from skimage.metrics import peak_signal_noise_ratio as psnr_fn
+
+    model.eval()
+    loader = DataLoader(test_ds, batch_size=1, shuffle=False,
+                        num_workers=NUM_WORKERS)
+    ssims, psnrs, wl1s = [], [], []
+
+    with torch.no_grad():
+        for frames, gt_wx_n, gt_wy_n, gt, names in loader:
+            frames  = frames.to(DEVICE)
+            gt_w    = torch.cat([gt_wx_n, gt_wy_n], 1).to(DEVICE)
+            gt_img  = gt.to(DEVICE)
+
+            pred_w, all_warps, _ = model(frames)
+
+            # Warp L1 in normalised space
+            wl1s.append(F.l1_loss(pred_w, gt_w).item())
+
+            # Restored image quality
+            B, C, H, W = frames[:, 1].shape
+            wx_px = pred_w[:, 0:1] * ws["wx_std"] + ws["wx_mean"]
+            wy_px = pred_w[:, 1:2] * ws["wy_std"] + ws["wy_mean"]
+            yy, xx = torch.meshgrid(torch.linspace(-1,1,H,device=DEVICE),
+                                    torch.linspace(-1,1,W,device=DEVICE),
+                                    indexing="ij")
+            base = torch.stack([xx,yy],-1).unsqueeze(0)
+            dx   = 2.0 * wx_px.squeeze(1) / (W-1)
+            dy   = 2.0 * wy_px.squeeze(1) / (H-1)
+            grid = torch.stack([base[...,0]-dx, base[...,1]-dy], -1)
+            rest = F.grid_sample(frames[:,1], grid, mode="bilinear",
+                                 padding_mode="border", align_corners=True)
+
+            r_np = ((rest[0].float().cpu().numpy().transpose(1,2,0)+1)/2).clip(0,1)
+            g_np = ((gt_img[0].float().cpu().numpy().transpose(1,2,0)+1)/2).clip(0,1)
+            ssims.append(ssim_fn(g_np, r_np, channel_axis=2, data_range=1))
+            psnrs.append(psnr_fn(g_np, r_np, data_range=1))
+
+    print("\n" + "="*50)
+    print("DIS-NET  TEST RESULTS")
+    print("="*50)
+    print(f"Warp L1 (norm):  {np.mean(wl1s):.4f}")
+    print(f"SSIM:            {np.mean(ssims):.4f}")
+    print(f"PSNR:            {np.mean(psnrs):.2f} dB")
+    return {"warp_l1": float(np.mean(wl1s)),
+            "ssim":    float(np.mean(ssims)),
+            "psnr":    float(np.mean(psnrs))}
+
+
+# ==============================================================================
+# 10.  ENTRY POINT
+# ==============================================================================
+model, test_ds, ws, complete = train()
+
+if not complete:
+    print(f"\nRe-run this script to continue the next "
+          f"{EPOCHS_PER_RUN} epochs.")
+else:
+    print("\nRunning evaluation on test set...")
+    results = evaluate(model, test_ds, ws)
+    with open(os.path.join(OUT_DIR, "stage1_eval.json"), "w") as f:
+        json.dump(results, f, indent=2)
+    print("\nStage 1 complete. Run dgnet_stage2_dggan.py for image restoration.")
