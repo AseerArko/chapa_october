@@ -2,31 +2,40 @@
 # DG-NET  —  STAGE 2: DG-GAN  (Distortion-Guided Image Restorer)
 # DTD-FSRN dataset  |  Based on Thapa et al., ICCV 2021
 #
-# Prerequisite: Stage 1 (dgnet_stage1_disnet.py) must be complete.
-#   Required files:
-#     /kaggle/working/dgnet_stage1/checkpoints/disnet_final.pth
-#     /kaggle/working/dgnet_stage1/checkpoints/warp_stats.json
+# Adapted to the Stage 1 mean-frame-reference Dis-Net (dgnet_stage1_ref_v2.py).
 #
-# What this stage does:
-#   1. Load the trained Dis-Net (frozen) to predict warp fields.
-#   2. Apply backward warp to produce a coarsely-corrected image J_W.
-#   3. Feed J_W into a U-Net generator G that refines it into a clean image Ĵ.
-#   4. Train G against a PatchGAN discriminator D using distortion-guided losses
-#      (Thapa et al. §3.2, Eq. 8 & 9):
-#        L_G  =  L1(G(J_W), J)  +  L2(G(J_W), J)  +  L2(F(G(J_W), W), I)
-#        L_GAN conditioned on distortion map W
+# CHANGES vs. the previous Stage 2
+# --------------------------------
+# 1. Dis-Net classes are copied verbatim from Stage 1 (6-ch input, fixed decoder
+#    skip channels, d1 in use, forward(frames, ref)) so the checkpoint loads.
+# 2. The cached mean frame (Stage 1 ref_cache) is loaded per sequence and passed
+#    to Dis-Net everywhere.  New OUT_DIR so no old Stage 2 state is resumed.
+# 3. UNetGenerator channel / resolution mismatches fixed (d3/d2/d1/out input
+#    channels, and the last layer is now stride-1 so output stays 256x256).
+# 4. Dis-Net output is clamped to +-5, matching what Stage 1 trained against.
+# 5. Frozen Dis-Net is kept in eval() after save_sample (it used to be switched
+#    back to train mode, which would update its BatchNorm statistics).
+# 6. Generator is now warp-aware: input = [I_mid | J_W | warp/clamp] (8 ch).
+# 7. Speed: Dis-Net under fp16 autocast, one G forward shared by the D and G
+#    steps, cached frame lists, no per-step .item() syncs, bigger batch,
+#    drop_last, and a per-epoch 'data wait' timer (see below).
+# 8. Fixed grad clipping: unscale before clip_grad_norm_ (it used to clip the
+#    still-scaled fp16 gradients, which shrank G's effective step size).
 #
-# Resumable:
-#   Full state saved atomically every epoch.
-#   Set EPOCHS_PER_RUN and re-run to continue from the last checkpoint.
+# Prerequisite: Stage 1 complete.  Required files:
+#     <STAGE1_DIR>/disnet_final.pth     (or set DISNET_CKPT to disnet_epochNNN.pth)
+#     <STAGE1_DIR>/warp_stats.json
+#     <REF_DIR>/*.npy                   (mean-frame cache built by Stage 1)
+#
+# Resumable: full state saved atomically every epoch.
 #
 # Outputs:
-#   /kaggle/working/dgnet_stage2/checkpoints/resume_state.pth
-#   /kaggle/working/dgnet_stage2/checkpoints/generator_epoch{N}.pth
-#   /kaggle/working/dgnet_stage2/checkpoints/generator_final.pth
-#   /kaggle/working/dgnet_stage2/epoch_loss_log.csv
-#   /kaggle/working/dgnet_stage2/samples/epoch_{N:03d}.png
-#   /kaggle/working/dgnet_stage2/evaluation_results.json
+#   /kaggle/working/dgnet_stage2_ref_wcond/checkpoints/resume_state.pth
+#   /kaggle/working/dgnet_stage2_ref_wcond/checkpoints/generator_epoch{N}.pth
+#   /kaggle/working/dgnet_stage2_ref_wcond/checkpoints/generator_final.pth
+#   /kaggle/working/dgnet_stage2_ref_wcond/epoch_loss_log.csv
+#   /kaggle/working/dgnet_stage2_ref_wcond/samples/epoch_{N:03d}.png
+#   /kaggle/working/dgnet_stage2_ref_wcond/evaluation_results.json
 # ==============================================================================
 
 import os, glob, random, json, time, sys
@@ -52,30 +61,37 @@ PART_NUMBERS   = [5, 6, 7, 8, 9, 10]
 ROOT_TMPL      = "/kaggle/input/datasets/aseermuntaqueemarko/dtd-fsrn-part-{:02d}"
 WAVE_TYPE      = "ocean"
 IMG_SIZE       = 256
-NUM_EPOCHS     = 400        # Thapa et al. train DG-GAN for ~400 epochs
+NUM_EPOCHS     = 150        # 400 was ~22 h at ~200 s/epoch; loss plateaued by ~55
 EPOCHS_PER_RUN = 25
 
 LR_G    = 2e-4
 LR_D    = 2e-4
 BETA1   = 0.5
+DECAY_START = 75     # LR is constant until this epoch, then linear -> 0 at NUM_EPOCHS
 
 # Loss weights (Thapa et al. Eq. 8)
 LAMBDA_L1   = 1.0    # L1 reconstruction
 LAMBDA_L2   = 1.0    # L2 reconstruction
 LAMBDA_DIST = 1.0    # distortion cycle-consistency
-LAMBDA_GAN  = 0.5    # adversarial weight
+LAMBDA_GAN  = 0.05   # adversarial weight (was 0.5: GAN term was ~14x the recon terms)
+
+WARP_CLAMP   = 5.0   # Stage 1 trained with warps clamped to +-5 std
+G_IN_CH      = 8     # generator input: I_mid (3) + J_W (3) + warp (2)
 
 TEST_SPLIT   = 0.10
 SEED         = 42
 NUM_WORKERS  = 4
-BATCH_SIZE   = 4     # U-Net is memory-heavy; reduce if OOM
+BATCH_SIZE   = 8     # fp16 U-Net; drop back to 4 if you hit OOM
 
 # Stage 1 paths (must exist)
-STAGE1_DIR        = "/kaggle/working/dgnet_stage1/checkpoints"
+STAGE1_OUT        = "/kaggle/working/dgnet_stage1_ref"
+STAGE1_DIR        = os.path.join(STAGE1_OUT, "checkpoints")
+REF_DIR           = os.path.join(STAGE1_OUT, "ref_cache")
 DISNET_CKPT       = os.path.join(STAGE1_DIR, "disnet_final.pth")
+# DISNET_CKPT     = os.path.join(STAGE1_DIR, "disnet_epoch100.pth")  # any saved epoch
 WARP_STATS_PATH   = os.path.join(STAGE1_DIR, "warp_stats.json")
 
-OUT_DIR  = "/kaggle/working/dgnet_stage2"
+OUT_DIR  = "/kaggle/working/dgnet_stage2_ref_wcond"
 CKPT_DIR = os.path.join(OUT_DIR, "checkpoints")
 SAMP_DIR = os.path.join(OUT_DIR, "samples")
 for d in [CKPT_DIR, SAMP_DIR]:
@@ -106,13 +122,14 @@ print(f"λ_L1={LAMBDA_L1}  λ_L2={LAMBDA_L2}  "
 # ==============================================================================
 if not os.path.isfile(DISNET_CKPT):
     raise RuntimeError(
-        f"Stage 1 checkpoint not found: {DISNET_CKPT}\n"
-        f"Run dgnet_stage1_disnet.py to completion first."
+        f"Dis-Net checkpoint not found: {DISNET_CKPT}\n"
+        f"Finish Stage 1 (disnet_final.pth) or point DISNET_CKPT at a saved "
+        f"disnet_epochNNN.pth."
     )
 if not os.path.isfile(WARP_STATS_PATH):
     raise RuntimeError(
         f"Warp stats not found: {WARP_STATS_PATH}\n"
-        f"Run dgnet_stage1_disnet.py to completion first."
+        f"Run Stage 1 first."
     )
 with open(WARP_STATS_PATH) as f:
     WARP_STATS = json.load(f)
@@ -120,6 +137,7 @@ print(f"Warp stats: wx_mean={WARP_STATS['wx_mean']:.3f} "
       f"wx_std={WARP_STATS['wx_std']:.3f}  "
       f"wy_mean={WARP_STATS['wy_mean']:.3f} "
       f"wy_std={WARP_STATS['wy_std']:.3f}")
+print(f"Dis-Net checkpoint: {DISNET_CKPT}")
 print("=" * 70)
 
 # ==============================================================================
@@ -147,14 +165,31 @@ def split_df(df):
     print(f"Train: {len(train)} seqs  |  Test: {len(test)} seqs")
     return train, test
 
+
+def ref_cache_path(row):
+    """Same key as Stage 1."""
+    key = f"{os.path.basename(row['_root'])}_{row['sequence_id']}"
+    return os.path.join(REF_DIR, f"{key}.npy")
+
+
+def check_ref_cache(df):
+    missing = [r["sequence_id"] for _, r in df.iterrows()
+               if not os.path.isfile(ref_cache_path(r))]
+    if missing:
+        raise RuntimeError(
+            f"{len(missing)} mean-frame cache files missing in {REF_DIR} "
+            f"(e.g. {missing[:3]}). Run Stage 1 first so the cache is built.")
+    print(f"[ref] All {len(df)} mean-frame references found.")
+
 # ==============================================================================
 # 3.  DATASET
-#     Returns 3 distorted frames (for Dis-Net) + GT clean image.
-#     Warp fields are predicted at runtime — NOT loaded from disk.
+#     Returns 3 distorted frames, the mean-frame reference (both for Dis-Net)
+#     and the GT clean image.  Warp fields are predicted at runtime.
 # ==============================================================================
 class WaveDataset(Dataset):
     def __init__(self, df):
         self.df = df.reset_index(drop=True)
+        self._paths = {}      # per-worker cache of sorted frame lists
 
     def __len__(self):
         return len(self.df)
@@ -169,19 +204,22 @@ class WaveDataset(Dataset):
     def __getitem__(self, idx):
         row  = self.df.iloc[idx]
         root = row["_root"]
-        paths = sorted(glob.glob(
-                    os.path.join(root, row["image_sequence"], "*.png")))
+        paths = self._paths.get(idx)
+        if paths is None:
+            paths = sorted(glob.glob(
+                        os.path.join(root, row["image_sequence"], "*.png")))
+            self._paths[idx] = paths
         if len(paths) < 3:
             raise RuntimeError(f"Need ≥3 frames: {row['image_sequence']}")
         lo     = random.randint(0, len(paths) - 3)
         frames = torch.stack([self._img(paths[lo+t]) for t in range(3)], 0)
+        ref    = torch.from_numpy(
+                    np.load(ref_cache_path(row)).astype(np.float32))   # (3,H,W)
         gt     = self._img(os.path.join(root, row["gt"]))
-        return frames, gt, row["sequence_id"]
+        return frames, ref, gt, row["sequence_id"]
 
 # ==============================================================================
-# 4.  IMPORT Dis-Net from Stage 1
-#     We re-define only what we need (SingleFrameCNN + ConvLSTMCell + DisNet)
-#     rather than importing the whole Stage 1 script.
+# 4.  Dis-Net  (copied verbatim from Stage 1 so the checkpoint loads)
 # ==============================================================================
 class EncoderBlock(nn.Module):
     def __init__(self, in_ch, out_ch):
@@ -190,83 +228,146 @@ class EncoderBlock(nn.Module):
             nn.Conv2d(in_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch),
             nn.LeakyReLU(0.2, True),
             nn.Conv2d(out_ch, out_ch, 3, padding=1), nn.BatchNorm2d(out_ch),
-            nn.LeakyReLU(0.2, True))
+            nn.LeakyReLU(0.2, True),
+        )
         self.pool = nn.MaxPool2d(2)
+
     def forward(self, x):
-        f = self.conv(x); return self.pool(f), f
+        feat = self.conv(x)
+        return self.pool(feat), feat   # (pooled, skip)
 
 
 class DecoderBlock(nn.Module):
+    """Variational refinement: up + skip + intermediate warp -> refined warp."""
     def __init__(self, in_ch, skip_ch, out_ch):
         super().__init__()
-        self.up        = nn.ConvTranspose2d(in_ch, out_ch, 4, 2, 1)
-        self.warp_proj = nn.Conv2d(2, out_ch, 1)
-        self.conv      = nn.Sequential(
+        self.up   = nn.ConvTranspose2d(in_ch, out_ch, 4, stride=2, padding=1)
+        self.warp_proj = nn.Conv2d(2, out_ch, 1)   # intermediate warp map -> feat
+        self.conv = nn.Sequential(
             nn.Conv2d(out_ch + skip_ch + out_ch, out_ch, 3, padding=1),
-            nn.BatchNorm2d(out_ch), nn.LeakyReLU(0.2, True))
-        self.warp_head = nn.Conv2d(out_ch, 2, 1)
-    def forward(self, x, skip, pw):
-        up  = self.up(x)
-        pw  = F.interpolate(pw, up.shape[-2:], mode="bilinear", align_corners=True)
-        f   = self.conv(torch.cat([up, skip, self.warp_proj(pw)], 1))
-        return f, self.warp_head(f)
+            nn.BatchNorm2d(out_ch), nn.LeakyReLU(0.2, True),
+        )
+        self.warp_head = nn.Conv2d(out_ch, 2, 1)   # intermediate warp output
+
+    def forward(self, x, skip, prev_warp_up):
+        up   = self.up(x)
+        pw   = F.interpolate(prev_warp_up, size=up.shape[-2:],
+                             mode="bilinear", align_corners=True)
+        pw_f = self.warp_proj(pw)
+        cat  = torch.cat([up, skip, pw_f], dim=1)
+        feat = self.conv(cat)
+        warp = self.warp_head(feat)
+        return feat, warp
 
 
 class SingleFrameCNN(nn.Module):
-    def __init__(self):
+    """Predicts a (2,H,W) warp map from [distorted frame | reference] (6 ch)."""
+    def __init__(self, in_ch=6):
         super().__init__()
-        self.e1 = EncoderBlock(3, 32);  self.e2 = EncoderBlock(32, 64)
-        self.e3 = EncoderBlock(64, 128); self.e4 = EncoderBlock(128, 256)
-        self.btn = nn.Sequential(nn.Conv2d(256,256,3,padding=1),
-                                 nn.BatchNorm2d(256), nn.LeakyReLU(0.2,True))
-        self.wb  = nn.Conv2d(256, 2, 1)
-        self.d4  = DecoderBlock(256, 128, 128); self.d3 = DecoderBlock(128, 64, 64)
-        self.d2  = DecoderBlock(64,  32,  32)
-        self.fin = nn.Conv2d(16, 2, 1)
+        self.e1 = EncoderBlock(in_ch, 32)
+        self.e2 = EncoderBlock(32,  64)
+        self.e3 = EncoderBlock(64, 128)
+        self.e4 = EncoderBlock(128,256)
+
+        self.bottleneck = nn.Sequential(
+            nn.Conv2d(256, 256, 3, padding=1), nn.BatchNorm2d(256),
+            nn.LeakyReLU(0.2, True),
+        )
+        self.warp_bottleneck = nn.Conv2d(256, 2, 1)
+
+        self.d4 = DecoderBlock(256, 256, 128)
+        self.d3 = DecoderBlock(128, 128,  64)
+        self.d2 = DecoderBlock( 64,  64,  32)
+        self.d1 = DecoderBlock( 32,  32,  16)
+
+        self.final = nn.Conv2d(16, 2, 1)
+
     def forward(self, x):
-        p1,s1=self.e1(x); p2,s2=self.e2(p1); p3,s3=self.e3(p2); p4,s4=self.e4(p3)
-        b=self.btn(p4); w=self.wb(b)
-        f4,w4=self.d4(b,s4,w); f3,w3=self.d3(f4,s3,w4); f2,w2=self.d2(f3,s2,w3)
-        up1 = F.interpolate(f2, scale_factor=2, mode="bilinear", align_corners=True)
-        return self.fin(F.leaky_relu(up1,0.2)) + F.interpolate(
-               w2, up1.shape[-2:], mode="bilinear", align_corners=True), [w,w4,w3,w2]
+        p1, s1 = self.e1(x)
+        p2, s2 = self.e2(p1)
+        p3, s3 = self.e3(p2)
+        p4, s4 = self.e4(p3)
+
+        b  = self.bottleneck(p4)
+        w  = self.warp_bottleneck(b)
+
+        f4, w4 = self.d4(b,  s4, w)
+        f3, w3 = self.d3(f4, s3, w4)
+        f2, w2 = self.d2(f3, s2, w3)
+        f1, w1 = self.d1(f2, s1, w2)
+
+        warp_final = self.final(f1) + F.interpolate(
+            w1, size=f1.shape[-2:], mode="bilinear", align_corners=True)
+
+        return warp_final, [w, w4, w3, w2]
 
 
 class ConvLSTMCell(nn.Module):
-    def __init__(self, in_ch, h, ks=3):
-        super().__init__(); self.h = h
-        self.gates = nn.Conv2d(in_ch+h, 4*h, ks, padding=ks//2)
+    def __init__(self, in_ch, hidden_ch, ks=3):
+        super().__init__()
+        self.h = hidden_ch
+        self.gates = nn.Conv2d(in_ch + hidden_ch, 4 * hidden_ch, ks,
+                               padding=ks // 2)
+
     def forward(self, x, state):
-        hh,c = state
-        i,f,o,g = torch.chunk(self.gates(torch.cat([x,hh],1)),4,1)
-        c = torch.sigmoid(f)*c + torch.sigmoid(i)*torch.tanh(g)
-        h = torch.sigmoid(o)*torch.tanh(c); return h,c
-    def init(self, B, H, W, dev, dtype):
-        z = torch.zeros(B,self.h,H,W,device=dev,dtype=dtype); return z.clone(),z.clone()
+        h, c = state
+        i, f, o, g = torch.chunk(self.gates(torch.cat([x, h], 1)), 4, 1)
+        c = torch.sigmoid(f) * c + torch.sigmoid(i) * torch.tanh(g)
+        h = torch.sigmoid(o) * torch.tanh(c)
+        return h, c
+
+    def init(self, B, H, W, device, dtype):
+        z = torch.zeros(B, self.h, H, W, device=device, dtype=dtype)
+        return z.clone(), z.clone()
 
 
 class DisNet(nn.Module):
+    """
+    Input:  frames (B,3,3,H,W) distorted frames,  ref (B,3,H,W) mean frame
+    Output: warp   (B,2,H,W)   normalised warp field for middle frame
+    """
     def __init__(self, lstm_hidden=64):
         super().__init__()
-        self.branch = SingleFrameCNN()
-        self.lstm1  = ConvLSTMCell(2, lstm_hidden)
-        self.lstm2  = ConvLSTMCell(lstm_hidden, lstm_hidden)
+        self.branch = SingleFrameCNN(in_ch=6)
+        self.lstm1 = ConvLSTMCell(2, lstm_hidden)
+        self.lstm2 = ConvLSTMCell(lstm_hidden, lstm_hidden)
         self.refine = nn.Sequential(
-            nn.Conv2d(lstm_hidden, 32, 3, padding=1), nn.LeakyReLU(0.2,True),
-            nn.Conv2d(32, 2, 1))
-    def forward(self, frames):
-        B,T,C,H,W = frames.shape
-        h1,c1 = self.lstm1.init(B,H,W,frames.device,frames.dtype)
-        h2,c2 = self.lstm2.init(B,H,W,frames.device,frames.dtype)
-        warps = []
+            nn.Conv2d(lstm_hidden, 32, 3, padding=1), nn.LeakyReLU(0.2, True),
+            nn.Conv2d(32, 2, 1),
+        )
+
+    def forward(self, frames, ref):
+        B, T, C, H, W = frames.shape
+        h1, c1 = self.lstm1.init(B, H, W, frames.device, frames.dtype)
+        h2, c2 = self.lstm2.init(B, H, W, frames.device, frames.dtype)
+
+        all_warps = []
+        all_inter = []
+
         for t in range(T):
-            w,_ = self.branch(frames[:,t])
-            h1,c1 = self.lstm1(w,(h1,c1)); h2,c2 = self.lstm2(h1,(h2,c2))
-            warps.append(self.refine(h2) + w)
-        return warps[1]   # middle frame warp
+            x_t = torch.cat([frames[:, t], ref], dim=1)     # (B,6,H,W)
+            warp_t, inter_t = self.branch(x_t)
+            h1, c1 = self.lstm1(warp_t, (h1, c1))
+            h2, c2 = self.lstm2(h1,     (h2, c2))
+            refined = self.refine(h2) + warp_t
+            all_warps.append(refined)
+            all_inter.append(inter_t)
+
+        return all_warps[1], all_warps, all_inter[1]
+
+
+class WarpPredictor(nn.Module):
+    """Frozen Dis-Net wrapper: middle-frame warp, clamped like Stage 1 training."""
+    def __init__(self, disnet):
+        super().__init__()
+        self.net = disnet
+
+    def forward(self, frames, ref):
+        w, _, _ = self.net(frames, ref)
+        return w.clamp(-WARP_CLAMP, WARP_CLAMP)
 
 # ==============================================================================
-# 5.  BACKWARD WARP UTILITY
+# 5.  BACKWARD / FORWARD WARP UTILITIES
 # ==============================================================================
 def backward_warp(img, pred_w_norm, ws):
     """
@@ -306,8 +407,30 @@ def forward_warp(img, pred_w_norm, ws):
     return F.grid_sample(img, grid, mode="bilinear",
                          padding_mode="border", align_corners=True)
 
+def build_g_input(I_mid, J_W, pred_w):
+    """
+    Warp-aware generator input (8 ch):
+        I_mid   raw distorted middle frame           (3)
+        J_W     coarse correction (I_mid unwarped)   (3)
+        warp    Dis-Net warp, scaled to ~[-1, 1]     (2)
+    The generator sees the distortion field next to the image it has to fix.
+    """
+    return torch.cat([I_mid, J_W, pred_w / WARP_CLAMP], 1)
+
+
 # ==============================================================================
 # 6.  GENERATOR — U-Net with 6 encoder / 6 decoder layers (Thapa et al. §3.2)
+#
+#   Encoder:  256 -> 128 -> 64 -> 32 -> 16 -> 8 -> 4
+#   Decoder:  4 -> 8 -> 16 -> 32 -> 64 -> 128 -> 256
+#   Channel bookkeeping (ngf=64), concat = decoder out + matching skip:
+#     d6: in  8*ngf (e6)                 -> 8*ngf   (8x8)
+#     d5: in  8+8 = 16*ngf (d6,e5)       -> 8*ngf   (16x16)
+#     d4: in  8+8 = 16*ngf (d5,e4)       -> 8*ngf   (32x32)
+#     d3: in  8+4 = 12*ngf (d4,e3)       -> 4*ngf   (64x64)
+#     d2: in  4+2 =  6*ngf (d3,e2)       -> 2*ngf   (128x128)
+#     d1: in  2+1 =  3*ngf (d2,e1)       -> 1*ngf   (256x256)
+#     out: in ngf + in_ch (d1, input)    -> out_ch  (256x256, stride-1 conv)
 # ==============================================================================
 class UNetBlock(nn.Module):
     def __init__(self, in_ch, out_ch, down=True, bn=True, dropout=False):
@@ -326,13 +449,12 @@ class UNetBlock(nn.Module):
 
 class UNetGenerator(nn.Module):
     """
-    Input:  J_W  — coarsely corrected image  (B, 3, 256, 256)
+    Input:  [I_mid | J_W | warp]  (B, 8, 256, 256)  — see build_g_input
     Output: Ĵ   — refined clean image        (B, 3, 256, 256)
-    6-level U-Net with skip connections (Thapa et al. uses same structure).
     """
-    def __init__(self, in_ch=3, out_ch=3, ngf=64):
+    def __init__(self, in_ch=G_IN_CH, out_ch=3, ngf=64):
         super().__init__()
-        # Encoder (256->128->64->32->16->8->4)
+        # Encoder
         self.e1 = nn.Sequential(nn.Conv2d(in_ch, ngf, 4, 2, 1))   # no BN first
         self.e2 = UNetBlock(ngf,   ngf*2)
         self.e3 = UNetBlock(ngf*2, ngf*4)
@@ -340,16 +462,17 @@ class UNetGenerator(nn.Module):
         self.e5 = UNetBlock(ngf*8, ngf*8)
         self.e6 = UNetBlock(ngf*8, ngf*8)
 
-        # Decoder (4->8->16->32->64->128->256)
+        # Decoder (input channels = previous decoder out + matching skip)
         self.d6 = UNetBlock(ngf*8,  ngf*8, down=False, dropout=True)
         self.d5 = UNetBlock(ngf*16, ngf*8, down=False, dropout=True)
         self.d4 = UNetBlock(ngf*16, ngf*8, down=False, dropout=True)
-        self.d3 = UNetBlock(ngf*16, ngf*4, down=False)
-        self.d2 = UNetBlock(ngf*8,  ngf*2, down=False)
-        self.d1 = UNetBlock(ngf*4,  ngf,   down=False)
+        self.d3 = UNetBlock(ngf*12, ngf*4, down=False)
+        self.d2 = UNetBlock(ngf*6,  ngf*2, down=False)
+        self.d1 = UNetBlock(ngf*3,  ngf,   down=False)
 
+        # d1 is already at full resolution -> stride-1 output conv
         self.out = nn.Sequential(
-            nn.ConvTranspose2d(ngf*2, out_ch, 4, 2, 1),
+            nn.Conv2d(ngf + in_ch, out_ch, 3, 1, 1),
             nn.Tanh()
         )
 
@@ -364,9 +487,7 @@ class UNetGenerator(nn.Module):
         d3 = self.d3(torch.cat([d4, e3], 1))
         d2 = self.d2(torch.cat([d3, e2], 1))
         d1 = self.d1(torch.cat([d2, e1], 1))
-        return self.out(torch.cat([d1,
-               F.interpolate(x, d1.shape[-2:], mode="bilinear",
-                             align_corners=True)], 1))
+        return self.out(torch.cat([d1, x], 1))   # d1 and x are both 256x256
 
 # ==============================================================================
 # 7.  DISCRIMINATOR — PatchGAN conditioned on J_W (the coarse correction)
@@ -467,12 +588,13 @@ def load_ckpt(G, D, opt_g, opt_d, sg, sd):
 def save_sample(G, dis_net, ds, epoch, ws):
     G.eval(); dis_net.eval()
     with torch.no_grad():
-        frames, gt, _ = ds[0]
+        frames, ref, gt, _ = ds[0]
         f_b = frames.unsqueeze(0).to(DEVICE)
+        r_b = ref.unsqueeze(0).to(DEVICE)
 
-        pred_w = dis_net(f_b)                               # (1,2,H,W)
+        pred_w = dis_net(f_b, r_b)                          # (1,2,H,W)
         J_W    = backward_warp(f_b[:, 1], pred_w, ws)      # coarse correction
-        J_hat  = G(J_W)                                     # refined output
+        J_hat  = G(build_g_input(f_b[:, 1], J_W, pred_w))   # refined output
 
     def to_rgb(t):
         return ((t[0].float().cpu().permute(1,2,0).numpy()+1)/2).clip(0,1)
@@ -492,32 +614,37 @@ def save_sample(G, dis_net, ds, epoch, ws):
     plt.tight_layout()
     plt.savefig(os.path.join(SAMP_DIR, f"epoch_{epoch:03d}.png"), dpi=150)
     plt.close(fig)
-    G.train(); dis_net.train()
+    G.train()
+    dis_net.eval()      # Dis-Net is frozen: never put it back in train mode
 
 # ==============================================================================
 # 10.  TRAINING
 # ==============================================================================
 def train():
     df = load_metadata()
+    check_ref_cache(df)
     train_df, test_df = split_df(df)
 
     train_ds = WaveDataset(train_df)
     test_ds  = WaveDataset(test_df)
 
+    loader_kw = dict(num_workers=NUM_WORKERS, pin_memory=True,
+                     persistent_workers=(NUM_WORKERS > 0))
+    if NUM_WORKERS > 0:
+        loader_kw["prefetch_factor"] = 4
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True,
-                              num_workers=NUM_WORKERS, pin_memory=True,
-                              persistent_workers=(NUM_WORKERS > 0))
+                              drop_last=True, **loader_kw)
 
-    # ---- Load frozen Dis-Net ----
-    dis_net = DisNet().to(DEVICE)
-    dis_net.load_state_dict(
+    # ---- Load frozen Dis-Net (load BEFORE any DataParallel wrapping) ----
+    disnet = DisNet().to(DEVICE)
+    disnet.load_state_dict(
         torch.load(DISNET_CKPT, map_location=DEVICE, weights_only=True))
+    dis_net = WarpPredictor(disnet).to(DEVICE)
     dis_net.eval()
     for p in dis_net.parameters():
         p.requires_grad_(False)
-    print(f"[setup] Dis-Net loaded from {DISNET_CKPT} (frozen).")
+    print(f"[setup] Dis-Net loaded from {DISNET_CKPT} (frozen, clamp ±{WARP_CLAMP}).")
 
-    # Wrap for multi-GPU inference
     if USE_MULTI_GPU:
         dis_net = nn.DataParallel(dis_net)
 
@@ -547,30 +674,44 @@ def train():
     print(f"[train] This run: epochs {start}–{end} of {NUM_EPOCHS}.")
 
     for epoch in range(start, end + 1):
-        G.train(); D.train()
-        totals = {"g": 0., "d": 0., "l1": 0., "l2": 0., "dist": 0.}
+        # linear LR decay (set per epoch, so it is resume-safe)
+        frac   = 1.0 if epoch < DECAY_START else \
+                 max(0.0, (NUM_EPOCHS - epoch + 1) / (NUM_EPOCHS - DECAY_START + 1))
+        lr_now = LR_G * frac
+        for o, base in ((opt_g, LR_G), (opt_d, LR_D)):
+            for g in o.param_groups:
+                g['lr'] = base * frac
+        G.train(); D.train(); dis_net.eval()
+        totals = {k: torch.zeros((), device=DEVICE)
+                  for k in ("g", "d", "l1", "l2", "dist")}
         t0 = time.perf_counter()
+        t_prev = t0
+        data_wait = 0.0          # time the GPU loop spent waiting for a batch
 
-        for frames, gt, _ in train_loader:
+        for frames, ref, gt, _ in train_loader:
+            data_wait += time.perf_counter() - t_prev
             frames = frames.to(DEVICE, non_blocking=True)   # (B,3,3,H,W)
+            ref    = ref.to(DEVICE,    non_blocking=True)   # (B,3,H,W)
             gt     = gt.to(DEVICE,     non_blocking=True)   # (B,3,H,W)
             I_mid  = frames[:, 1]                           # distorted mid frame
 
-            # ---- Dis-Net inference (no grad) ----
+            # ---- frozen Dis-Net (fp16, no grad) + coarse correction ----
             with torch.no_grad():
-                pred_w = dis_net(frames)                    # (B,2,H,W)
+                with torch.amp.autocast("cuda", enabled=USE_AMP):
+                    pred_w = dis_net(frames, ref)           # (B,2,H,W)
+                pred_w = pred_w.float()
+                J_W    = backward_warp(I_mid, pred_w, WARP_STATS)
 
-            J_W = backward_warp(I_mid, pred_w, WARP_STATS) # coarse correction
+            cond = torch.cat([J_W, pred_w], 1)              # D condition (5 ch)
+            g_in = build_g_input(I_mid, J_W, pred_w)        # G input     (8 ch)
 
-            # Condition for discriminator: J_W concatenated with warp map
-            cond = torch.cat([J_W, pred_w], 1)             # (B,5,H,W)
+            # ---- one generator forward, shared by the D and G steps ----
+            with torch.amp.autocast("cuda", enabled=USE_AMP):
+                J_hat = G(g_in)
 
             # ---- Discriminator step ----
             opt_d.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=USE_AMP):
-                with torch.no_grad():
-                    J_hat = G(J_W)                          # fake
-
                 real_out = D(cond, gt)
                 fake_out = D(cond, J_hat.detach())
                 loss_d   = 0.5 * (
@@ -580,21 +721,20 @@ def train():
             sd.scale(loss_d).backward()
             sd.step(opt_d); sd.update()
 
-            # ---- Generator step ----
+            # ---- Generator step (D params frozen: no wasted D gradients) ----
+            for q in D.parameters():
+                q.requires_grad_(False)
             opt_g.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=USE_AMP):
-                J_hat    = G(J_W)
-
-                # Adversarial
                 fake_out = D(cond, J_hat)
                 loss_adv = adv_loss(fake_out, torch.ones_like(fake_out))
 
-                # L1 + L2 reconstruction (Thapa et al. Eq. 8)
-                loss_l1  = F.l1_loss(J_hat, gt)
-                loss_l2  = F.mse_loss(J_hat, gt)
+                Jf       = J_hat.float()
+                loss_l1  = F.l1_loss(Jf, gt)
+                loss_l2  = F.mse_loss(Jf, gt)
 
-                # Distortion cycle-consistency: forward-warp J_hat → compare to I_mid
-                I_hat_G  = forward_warp(J_hat, pred_w, WARP_STATS)
+                # distortion cycle: forward-warp J_hat -> compare to I_mid
+                I_hat_G   = forward_warp(Jf, pred_w, WARP_STATS)
                 loss_dist = F.mse_loss(I_hat_G, I_mid)
 
                 loss_g = (LAMBDA_GAN  * loss_adv  +
@@ -603,26 +743,31 @@ def train():
                           LAMBDA_DIST * loss_dist)
 
             sg.scale(loss_g).backward()
+            sg.unscale_(opt_g)                       # unscale BEFORE clipping
             nn.utils.clip_grad_norm_(G.parameters(), 1.0)
             sg.step(opt_g); sg.update()
+            for q in D.parameters():
+                q.requires_grad_(True)
 
-            totals["g"]    += loss_g.item()
-            totals["d"]    += loss_d.item()
-            totals["l1"]   += loss_l1.item()
-            totals["l2"]   += loss_l2.item()
-            totals["dist"] += loss_dist.item()
+            totals["g"]    += loss_g.detach()
+            totals["d"]    += loss_d.detach()
+            totals["l1"]   += loss_l1.detach()
+            totals["l2"]   += loss_l2.detach()
+            totals["dist"] += loss_dist.detach()
+            t_prev = time.perf_counter()
 
         n    = len(train_loader)
-        avgs = {k: v/n for k, v in totals.items()}
+        avgs = {k: float(v) / n for k, v in totals.items()}
         elapsed = time.perf_counter() - t0
 
         print(f"Epoch {epoch:03d}/{NUM_EPOCHS} | "
               f"G={avgs['g']:.4f} | D={avgs['d']:.4f} | "
               f"L1={avgs['l1']:.4f} | L2={avgs['l2']:.4f} | "
-              f"Dist={avgs['dist']:.4f} | {elapsed:.1f}s")
+              f"Dist={avgs['dist']:.4f} | {elapsed:.1f}s "
+              f"(data wait {data_wait:.1f}s) lr={lr_now:.2e}")
 
         row = {"epoch": epoch, **{f"avg_{k}": v for k, v in avgs.items()},
-               "time_s": elapsed,
+               "time_s": elapsed, "data_wait_s": data_wait,
                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S")}
         append_csv(row, LOG_CSV)
         history.append(row)
@@ -655,11 +800,11 @@ def evaluate(G, dis_net, test_ds):
     ssims, psnrs, mses = [], [], []
 
     with torch.no_grad():
-        for frames, gt, names in loader:
-            frames = frames.to(DEVICE); gt = gt.to(DEVICE)
-            pred_w = dis_net(frames)
+        for frames, ref, gt, names in loader:
+            frames = frames.to(DEVICE); ref = ref.to(DEVICE); gt = gt.to(DEVICE)
+            pred_w = dis_net(frames, ref)
             J_W    = backward_warp(frames[:, 1], pred_w, WARP_STATS)
-            J_hat  = G(J_W)
+            J_hat  = G(build_g_input(frames[:, 1], J_W, pred_w))
 
             r = ((J_hat[0].float().cpu().numpy().transpose(1,2,0)+1)/2).clip(0,1)
             g = ((gt[0].float().cpu().numpy().transpose(1,2,0)+1)/2).clip(0,1)
