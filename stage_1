@@ -19,6 +19,15 @@
 #   * Dataset returns (frames, ref, wx_n, wy_n, gt, seq_id)
 #   * build_ref_cache() runs once and caches (3,H,W) float16 .npy per sequence
 #
+# PATCH v3 — high-frequency detail (see PATCH_NOTES.md)
+# -----------------------------------------------------
+#   * loss_warp: removed the height round-trip terms L2/L3 (their target was ~2x
+#     the GT warp and they amplified fine detail), kept L1 + multi-scale.
+#   * new gradient_matching_error (+ LAMBDA_GRAD) to preserve spatial detail.
+#   * magnitude penalty now acts on the UNclamped output (it was inert past the
+#     clamp).  Sample plots / evaluate() now clamp like training does.
+#   * extra L_G column in the log -> LOG_CSV renamed to avoid column mismatch.
+#
 # NOTE: checkpoints from the 3-channel model are NOT compatible, so OUT_DIR is
 # different.  If SEED / TEST_SPLIT / PART_NUMBERS are unchanged you can copy
 # warp_stats.json from the old checkpoints dir into the new one to skip the scan.
@@ -46,7 +55,7 @@ ROOT_TMPL      = "/kaggle/input/datasets/aseermuntaqueemarko/dtd-fsrn-part-{:02d
 WAVE_TYPE      = "ocean"
 IMG_SIZE       = 256
 NUM_FRAMES_IN  = 3          # DG-Net uses 3 consecutive frames
-NUM_EPOCHS     = 100
+NUM_EPOCHS     = 1000
 EPOCHS_PER_RUN = 30         # how many epochs per Kaggle session
 
 LR         = 5e-5
@@ -56,6 +65,8 @@ BATCH_SIZE = 8              # paper uses 64; cap at GPU memory limit
 ALPHA_1 = 0.55   # direct warp L_W weight
 ALPHA_2 = 0.25   # refraction loss L_R weight
 ALPHA_3 = 0.15   # temporal consistency L_C weight
+LAMBDA_GRAD = 5.0           # weight of gradient-matching term inside L_W (untuned start value)
+WARP_CLAMP  = 5.0           # normalised-warp clamp used in training, sampling and eval
 H0         = 0.5            # metres — tune if warp magnitudes look wrong
 N_REFRACT  = 1.333
 ALPHA_SNELL = H0 * (1.0 - 1.0 / N_REFRACT)   # ~0.125
@@ -73,7 +84,7 @@ for d in [CKPT_DIR, SAMP_DIR, REF_DIR]:
 
 RESUME_PATH     = os.path.join(CKPT_DIR, "resume_state.pth")
 WARP_STATS_PATH = os.path.join(CKPT_DIR, "warp_stats.json")
-LOG_CSV         = os.path.join(OUT_DIR, "epoch_loss_log.csv")
+LOG_CSV         = os.path.join(OUT_DIR, "epoch_loss_log_v3.csv")
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 NUM_GPUS    = torch.cuda.device_count()
@@ -417,41 +428,35 @@ def scale_invariant_error(pred, target):
     return (mse - 0.5 * bias).mean()
 
 
-def loss_warp(pred_w, gt_w, inter_maps, gt_w_scales, warp_stats):
-    # Component 1: direct
-    L1 = scale_invariant_error(pred_w, gt_w)
+def gradient_matching_error(pred, target):
+    """
+    L1 between first-order finite differences (x and y) of two warp fields.
+    Penalises over-smoothing directly: a blurred prediction has small pixel
+    error but clearly wrong local gradients.
+    """
+    dpx = pred[..., :, 1:] - pred[..., :, :-1]
+    dtx = target[..., :, 1:] - target[..., :, :-1]
+    dpy = pred[..., 1:, :] - pred[..., :-1, :]
+    dty = target[..., 1:, :] - target[..., :-1, :]
+    return F.l1_loss(dpx, dtx) + F.l1_loss(dpy, dty)
 
-    def warp_to_height(w, alpha):
-        wx = w[:, 0] / alpha
-        wy = w[:, 1] / alpha
-        H  = torch.cumsum(wx, dim=-1) + torch.cumsum(wy, dim=-2)
-        return H   # (B,H,W)
 
-    def height_to_warp(H, alpha):
-        pad_x = F.pad(H.unsqueeze(1), (1, 0, 0, 0))   # pad left
-        pad_y = F.pad(H.unsqueeze(1), (0, 0, 1, 0))   # pad top
-        dx = (pad_x[:, :, :, 1:] - pad_x[:, :, :, :-1]) * alpha
-        dy = (pad_y[:, :, 1:, :] - pad_y[:, :, :-1, :]) * alpha
-        return torch.cat([dx, dy], dim=1)   # (B,2,H,W)
-
-    alpha = ALPHA_SNELL
-    H_gt  = warp_to_height(gt_w, alpha)
-    W_H   = height_to_warp(H_gt, alpha)       # should ≈ gt_w
-
-    H_pred = warp_to_height(pred_w, alpha)
-    W_Hpred = height_to_warp(H_pred, alpha)   # round-trip
-
-    L2 = scale_invariant_error(pred_w,  W_H)
-    L3 = scale_invariant_error(W_Hpred, gt_w)
-
-    L_W = L1 + L2 + L3
+def loss_warp(pred_w, gt_w, inter_maps, gt_w_scales, warp_stats, pred_raw=None):
+    """
+    pred_w   : clamped prediction (used for the reconstruction terms)
+    pred_raw : UNclamped prediction (used for the magnitude penalty so it still
+               has gradient outside the clamp range)
+    """
+    L_W = scale_invariant_error(pred_w, gt_w)
 
     # Multi-scale intermediate warp losses
     L_ms = 0.0
     for inter, gt_s in zip(inter_maps, gt_w_scales):
         L_ms = L_ms + scale_invariant_error(inter, gt_s)
 
-    mag_penalty = F.relu(pred_w.abs() - 4.0).mean()
+    if pred_raw is None:
+        pred_raw = pred_w
+    mag_penalty = F.relu(pred_raw.abs() - 4.0).mean()
     return L_W + 0.1 * L_ms + 0.5 * mag_penalty
 
 
@@ -598,7 +603,7 @@ def save_sample(model, ds, epoch, warp_stats):
         f_b = frames.unsqueeze(0).to(DEVICE)
         r_b = ref.unsqueeze(0).to(DEVICE)
         pred_w, _, _ = model(f_b, r_b)
-        pred_w = pred_w[0].cpu()
+        pred_w = pred_w[0].clamp(-WARP_CLAMP, WARP_CLAMP).cpu()
 
     fig, axes = plt.subplots(2, 5, figsize=(20, 8))
 
@@ -689,7 +694,7 @@ def train():
 
     for epoch in range(start, end + 1):
         model.train()
-        totals = {"loss": 0., "L_W": 0., "L_R": 0., "L_C": 0.}
+        totals = {"loss": 0., "L_W": 0., "L_G": 0., "L_R": 0., "L_C": 0.}
         t0 = time.perf_counter()
 
         for frames, ref, gt_wx_n, gt_wy_n, gt, _ in train_loader:
@@ -703,16 +708,18 @@ def train():
 
             opt.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=USE_AMP):
-                pred_w, all_warps, inter_maps = model(frames, ref)
-                # clamp prediction to ±5 std (GT range is ±3.5)
-                pred_w = pred_w.clamp(-5.0, 5.0)
-                all_warps = [w.clamp(-5.0, 5.0) for w in all_warps]
+                pred_raw, all_warps, inter_maps = model(frames, ref)
+                # clamp to ±WARP_CLAMP std (GT range is ±3.5); keep raw for penalty
+                pred_w    = pred_raw.clamp(-WARP_CLAMP, WARP_CLAMP)
+                all_warps = [w.clamp(-WARP_CLAMP, WARP_CLAMP) for w in all_warps]
 
-                l_w = loss_warp(pred_w, gt_w, inter_maps, gt_w_scales, ws)
+                l_w = loss_warp(pred_w, gt_w, inter_maps, gt_w_scales, ws, pred_raw)
+                l_g = gradient_matching_error(pred_w, gt_w)
                 l_r = loss_refraction(frames, pred_w, ws)
                 l_c = loss_temporal(frames, all_warps, ws)
 
-                loss = ALPHA_1 * l_w + ALPHA_2 * l_r + ALPHA_3 * l_c
+                loss = (ALPHA_1 * (l_w + LAMBDA_GRAD * l_g)
+                        + ALPHA_2 * l_r + ALPHA_3 * l_c)
 
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -722,6 +729,7 @@ def train():
 
             totals["loss"] += loss.item()
             totals["L_W"]  += l_w.item()
+            totals["L_G"]  += l_g.item()
             totals["L_R"]  += l_r.item()
             totals["L_C"]  += l_c.item()
 
@@ -732,6 +740,7 @@ def train():
         print(f"Epoch {epoch:03d}/{NUM_EPOCHS} | "
               f"Loss={avgs['loss']:.4f} | "
               f"L_W={avgs['L_W']:.4f} | "
+              f"L_G={avgs['L_G']:.4f} | "
               f"L_R={avgs['L_R']:.4f} | "
               f"L_C={avgs['L_C']:.4f} | "
               f"{elapsed:.1f}s")
@@ -785,6 +794,7 @@ def evaluate(model, test_ds, ws):
             gt_img  = gt.to(DEVICE)
 
             pred_w, all_warps, _ = model(frames, ref)
+            pred_w = pred_w.clamp(-WARP_CLAMP, WARP_CLAMP)
 
             # Warp L1 in normalised space
             wl1s.append(F.l1_loss(pred_w, gt_w).item())
